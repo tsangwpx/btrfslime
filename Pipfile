@@ -1,0 +1,14 @@
+[[source]]
+name = "pypi"
+url = "https://pypi.org/simple"
+verify_ssl = true
+
+[dev-packages]
+psutil = "~=5.7.2"
+
+[packages]
+# the following need commented when setting up the environment on Windows
+#btrfslime = { editable = true, path = "."}
+cffi = "~=1.14.3"
+sqlalchemy = "~=1.3.20"
+tqdm = "==4.50.2"

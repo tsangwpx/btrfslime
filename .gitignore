@@ -1,0 +1,7 @@
+dedupe.db
+*.sw[a-p]
+btrfslime/*.so
+__pycache__/
+.idea/
+build/
+*.egg-info/
