@@ -278,7 +278,7 @@ def main():
         extent_size=ns.extent_size,
         small_extent_size=ns.small_extent_size,
         large_extent_size=ns.large_extent_size,
-        shared_extent_size=ns.min_shared_size,
+        shared_extent_size=ns.shared_size,
         tolerance=ns.tolerance,
     )
 
