@@ -328,10 +328,20 @@ class Runner:
                     else:
                         break
 
-            def finish_callback(hashes, file):
+            def onfinish(hashes, file):
                 file.hash1, file.hash2, file.hash3 = hashes
                 file.done = False
                 pending.append(file)
+
+            def onerror(exc, file):
+                file.hash1 = file.hash2 = file.hash3 = None
+                file.done = False
+                pending.append(file)
+
+                if isinstance(exc, (FileNotFoundError, PermissionError)):
+                    self.logger.info('Failed to hash %s due to %s', file.path, type(exc).__name__)
+                    return
+                raise
 
             def update_database(files):
                 with self._scoped_session() as db_:
@@ -341,7 +351,8 @@ class Runner:
             task = asyncio.create_task(executor_run_many(
                 lambda file: hash_file(file.path),
                 generator(),
-                onfinish=finish_callback,
+                onfinish=onfinish,
+                onerror=onerror,
                 workers=1,
                 executor=self._io_executor,
             ))
