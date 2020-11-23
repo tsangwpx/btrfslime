@@ -211,7 +211,7 @@ class Runner:
                 task_counter,
                 task_iterator,
                 workers=2,
-                finish_callback=finish_callback,
+                onfinish=finish_callback,
             )
 
             pbar.total = pbar.n
@@ -341,7 +341,7 @@ class Runner:
             task = asyncio.create_task(executor_run_many(
                 lambda file: hash_file(file.path),
                 generator(),
-                finish_callback=finish_callback,
+                onfinish=finish_callback,
                 workers=1,
                 executor=self._io_executor,
             ))
