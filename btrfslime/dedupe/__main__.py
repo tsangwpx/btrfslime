@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import contextlib
 import hashlib
@@ -47,7 +48,7 @@ def key_by_extents(extents: List[Extent]):
     )
 
 
-def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, min_neighbors: int = 2) -> List[Set[int]]:
+def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int = 2) -> Tuple[List[List[int]], Set[int]]:
     """
     Implement a modified DBSCAN to group files into clusters
 
@@ -57,19 +58,18 @@ def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, min_neighbors
 
     :param hashes: A sequence of 3-tuples of bytes
     :param eps min number of equal hashes to treat two files the same, depend on file size
-    :param min_neighbors should be 2
+    :param minimum should be 2
     """
     total = len(hashes)
-    processed: Set[int] = set()
-    clusters: List[Set[int]] = []
+    assigned: Set[int] = set()
+    clusters: List[List[int]] = []
+    noises = set()
 
     @lru_cache(maxsize=None)
     def same_file(p, q):
         """Tell whether two files are considered the same"""
         # list comprehension seem faster than sum()
-        return (p == q) or (eps <= len([
-            True for s, t in zip(hashes[p], hashes[q]) if s and s == t
-        ]))
+        return len([True for s, t in zip(hashes[p], hashes[q]) if s and s == t]) >= eps
 
     @lru_cache(maxsize=None)
     def find_neighbors(p):
@@ -79,37 +79,40 @@ def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, min_neighbors
         return [q for q in range(total) if (same_file(p, q) if p <= q else same_file(q, p))]
 
     for i in range(total):
-        if i in processed:  # This file has been assigned a group
+        if i in assigned:  # This file has been assigned a group
             continue
 
         neighbors = find_neighbors(i)
-        if len(neighbors) < min_neighbors:  # Not enough neighbors
+        if len(neighbors) < minimum:  # Not enough neighbors
+            noises.add(i)
             continue
 
-        processed.add(i)
-
-        neighbors = neighbors[:]  # copy
-        group = {i}
+        assigned.add(i)
+        group = [i]
         clusters.append(group)
 
-        # print('Group created: %s' % (i,))
+        pending = collections.deque([s for s in neighbors if s not in assigned])
 
-        while neighbors:
-            j = neighbors.pop()
-            if j in processed:  # This file has been assigned a group
+        while pending:
+            j = pending.popleft()
+            if j in assigned:  # This file has been assigned a group
                 continue
 
-            processed.add(j)
-            group.add(j)
-            neighbors2 = find_neighbors(j)
-            if len(neighbors2) < min_neighbors:
+            assigned.add(j)
+            group.append(j)
+
+            if j in noises:
+                noises.remove(j)
                 continue
 
-            neighbors.extend([i for i in neighbors2 if i not in processed])  # Though the filter is not necessary
+            neighbors = find_neighbors(j)
+            if len(neighbors) < minimum:
+                continue
+            pending.extend([s for s in neighbors if s not in assigned])
 
         # print('New group: %s' % (sorted(group),))
 
-    return clusters
+    return clusters, noises
 
 
 def fast_digests(path: AnyStr, blocksize: int, count: int) -> List[bytes]:
@@ -466,49 +469,44 @@ class Runner:
         with tqdm(total=total, desc='progress', unit='') as pbar:
             pbar.refresh()
 
-            def group_iterator() -> Iterator[List[File]]:
+            def commit_files(files: List[File]):
+                for f in files:
+                    f.done = True
+
+                with self._scoped_session() as db:
+                    db.bulk_save_objects(files, preserve_order=False)
+                    db.commit()
+
+                pbar.update(len(files))
+
+            def generate_tasks() -> Iterator[List[File]]:
                 for group_size in sizes:
+                    # Fetch files of a size group
                     with self._scoped_session() as db:
                         files = db.query(File).filter(File.size == group_size).all()
 
+                    # If file size >= 3MB, require 2 identical hashes. otherwise, 1 hash is enough.
                     min_hashes = 2 if group_size >= 3 * 1024 ** 2 else 1
 
                     hashes = [(s.hash1, s.hash2, s.hash3) for s in files]
-                    clusters = group_by_hashes(hashes, min_hashes)
-                    lonely_group = set(range(len(files))).difference(*clusters)
+                    clusters, noises = group_by_hashes(hashes, min_hashes)
 
-                    if lonely_group:
-                        group_files = [files[s] for s in lonely_group]
+                    if noises:
+                        commit_files([files[s] for s in noises])
 
-                        for file in group_files:
-                            file.done = True
+                    for group_ids in clusters:
+                        yield [files[s] for s in group_ids]
 
-                        with self._scoped_session() as db:
-                            db.bulk_save_objects(group_files, preserve_order=False)
-                            db.commit()
-
-                        pbar.update(len(lonely_group))
-
-                    for group in clusters:
-                        group_files = [files[s] for s in group]
-
-                        yield [file.path for file in group_files]
-
-                        for file in group_files:
-                            file.done = True
-
-                        with self._scoped_session() as db:
-                            db.bulk_save_objects(group_files, preserve_order=False)
-                            db.commit()
-
-                        pbar.update(len(group))
+            def dedupe_files(task_id, files):
+                self._dedupe_file_group(task_id, [s.path for s in files])
+                commit_files(files)
 
             task_counter = itertools.count()
 
             await executor_run_many(
-                self._dedupe_file_group,
+                dedupe_files,
                 task_counter,
-                group_iterator(),
+                generate_tasks(),
                 workers=2,
             )
 
