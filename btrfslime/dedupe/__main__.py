@@ -452,14 +452,13 @@ class Runner:
                     left -= chunksize
 
     async def _dedupe_files(self):
+        # Find same-size groups which their member files are updated / unprocessed
         with self._scoped_session() as session:
-            counts_and_sizes = (
-                session.query(func.count(), File.size)
-                    .filter(File.size > 0)
-                    .group_by(File.size)
-                    .having((func.count() >= 2) & (func.count() != func.sum(File.done)))
-                    .all()
-            )
+            q = (session.query(func.count(), File.size)
+                 .filter(File.size > 0, File.hash1.isnot(None))
+                 .group_by(File.size)
+                 .having((func.count() >= 2) & (func.count() != func.sum(File.done))))
+            counts_and_sizes = q.all()
 
         total = sum([s for s, _ in counts_and_sizes])
         sizes = [s for _, s in counts_and_sizes]
