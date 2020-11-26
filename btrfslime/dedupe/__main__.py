@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import bisect
 import collections
 import concurrent.futures
 import contextlib
@@ -377,67 +378,71 @@ class Runner:
 
             pbar.refresh()
 
-    def _dedupe_file_group(self, task_id: int, files: List[str]):
+    def _dedupe_file_group(self, task_id: int, paths: List[str]):
         """
         Given a list of paths, sort them using their extent distribution
         Choose the good-looking as the source file
 
         :param task_id a friendly number for logging
-        :param files a list of file names to dedupe
+        :param paths a list of file names to dedupe
         """
-        extent_lists = list(self._io_executor.map(fiemap, files))
-
-        # Sort them by extents
-        files, extent_lists = zip(*sorted(zip(files, extent_lists), key=lambda s: key_by_extents(s[1])))
-
-        src_path = files[0]
-        src_extents: List[Extent] = extent_lists[0]
-
-        dst_paths: List[str] = []
-        dst_extents: List[List[Extent]] = []
-
-        for i, extents in enumerate(extent_lists[1:], 1):  # type: (int, List[Extent])
-            if all(a == b for a, b in zip(src_extents, extents)):
-                # Skip file with the same physical extents
-                continue
-
-            dst_paths.append(files[i])
-            dst_extents.append(extents)
-
-        if not dst_paths:
-            return
-
-        del files, extent_lists
+        unknown_flags = ~(ExtentFlag.LAST | ExtentFlag.ENCODED | ExtentFlag.ENCRYPTED | ExtentFlag.SHARED)
+        attr_logical = operator.attrgetter('logical')
 
         with ExitStack() as stack:
-            src_fd = stack.enter_context(open(src_path, 'rb')).fileno()
-            dst_fds = [stack.enter_context(open(s, 'r+b')).fileno() for s in dst_paths]
+            # store valid paths and their relatives in a list of quadruplets
+            quadruplets = []  # (path, fd, extents, extent_keys)
+
+            for path in paths:
+                try:
+                    fd = stack.enter_context(open(path, 'r+b')).fileno()
+                except (FileNotFoundError, PermissionError) as ex:
+                    self.logger.warning('Inaccessible path: %s', str(ex))
+                    continue
+
+                extents = fiemap(fd)
+                bad_flags = next((unknown_flags & e.flags for e in extents), 0)
+                if bad_flags:
+                    self.logger.info(
+                        'Ignore %r with unsupported flags %r',
+                        bad_flags,
+                    )
+                    continue
+
+                extents.sort(key=attr_logical)
+                extent_keys = list(map(attr_logical, extents))
+                quadruplets.append((path, fd, extents, extent_keys))
+
+            if len(quadruplets) <= 1:
+                return
+
+            # Sort paths by extent distribution
+            quadruplets.sort(key=lambda s: key_by_extents(s[2]))
+            src_path, src_fd, src_extents, _ = quadruplets[0]
             size = os.fstat(src_fd).st_size
 
             for extent in src_extents:
-                dedupe_fds = []
-                dedupe_paths = []
+                dedupe_pairs = []  # (path, fd)
 
-                for target_fd, target_path, target_extents in zip(dst_fds, dst_paths, dst_extents):
-                    if extent in target_extents:
+                for dst_path, dst_fd, dst_extents, dst_extent_keys in quadruplets[1:]:
+                    extent_index = bisect.bisect_left(dst_extent_keys, extent.logical)
+                    if extent_index < len(dst_extents) and dst_extents[extent_index] == extent:
+                        # Skip file with the same physical extent
                         continue
+                    dedupe_pairs.append((dst_path, dst_fd))
 
-                    dedupe_fds.append(target_fd)
-                    dedupe_paths.append(target_path)
-
-                if not dedupe_fds:
+                if not dedupe_pairs:
                     continue
 
                 dedupe_offset = extent.logical
                 left = size - dedupe_offset if ExtentFlag.LAST in extent.flags else extent.length
-
-                chunksize = 1024 ** 2
+                chunksize = 1024 ** 2  # 1MB
 
                 while left > 0:
                     dedupe_size = min(chunksize, left)
                     task = DedupeTask(src_fd, offset=dedupe_offset, length=dedupe_size)
 
-                    for fd in dedupe_fds:
+                    for _, fd in dedupe_pairs:
                         task.add_target(fd, dedupe_offset)
 
                     try:
@@ -445,14 +450,12 @@ class Runner:
                     except DedupeError as ex:
                         bytes_deduped = ex.bytes_deduped
                         self.logger.warning(
-                            'task %d failed in offset %d %d: %s => %r',
+                            'task %d unequal data at offset %d size %d',
                             task_id, dedupe_offset, dedupe_size,
-                            src_path, dedupe_paths,
-                            exc_info=True,
                         )
 
-                    dedupe_offset += chunksize
-                    left -= chunksize
+                    dedupe_offset += dedupe_size
+                    left -= dedupe_size
 
     async def _dedupe_files(self):
         # Find same-size groups which their member files are updated / unprocessed
@@ -508,6 +511,7 @@ class Runner:
                 task_counter,
                 generate_tasks(),
                 workers=2,
+                executor=self._io_executor,
             )
 
             pbar.refresh()
