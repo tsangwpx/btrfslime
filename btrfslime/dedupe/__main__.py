@@ -244,62 +244,61 @@ class Runner:
         keys: List[bytes] = [t for _, t in table.values()]
         found_ids = set()
 
-        with self._scoped_session() as db:
-            updated = []
+        updated = []
+        created = []
+
+        if return_ids:
+            # According to EXPLAIN QUERY PLAN, filter by (path, digest) tuple did NOT use the digest index
+            # so use the simple IN filtering plus a Python dict to balance time and (disk) space.
+            with self._scoped_session() as db:
+                files: List[File] = db.query(File).filter(File.path_key.in_(keys)).all()
+
+            for file in files:
+                try:
+                    path_stat, _ = table.pop(file.path)
+                except KeyError:
+                    self.logger.debug('Path %r is missing, duplicate hash? %r', file.path, file.path_key.hex())
+                    continue
+                else:
+                    found_ids.add(file.id)
+
+                    if file.size == path_stat.st_size and file.mtime == path_stat.st_mtime:
+                        # Skip unchanged entry
+                        continue
+
+                    file.size = path_stat.st_size
+                    file.mtime = path_stat.st_mtime
+                    file.hash1 = file.hash2 = file.hash3 = None  # reset hashes
+                    file.done = False  # reset done flag
+                    updated.append(file)
+
+        for path, (path_stat, path_key) in table.items():
+            file = File(
+                path=path,
+                path_key=path_key,
+                size=path_stat.st_size,
+                mtime=path_stat.st_mtime
+            )
+            db.add(file)
+            created.append(file)
+
+        if not return_ids:
+            updated += created
             created = []
 
-            if return_ids:
-                # According to EXPLAIN QUERY PLAN, filter by (path, digest) tuple did NOT use the digest index
-                # so use the simple IN filtering plus a Python dict to balance time and (disk) space.
-                for file in db.query(File).filter(File.path_key.in_(keys)):  # type: File
-                    try:
-                        path_stat, _ = table.pop(file.path)
-                    except KeyError:
-                        self.logger.debug('Path %r is missing, duplicate hash? %r', file.path, file.path_key.hex())
-                        continue
-                    else:
-                        found_ids.add(file.id)
-
-                        if file.size == path_stat.st_size and file.mtime == path_stat.st_mtime:
-                            # Skip unchanged entry
-                            continue
-
-                        file.size = path_stat.st_size
-                        file.mtime = path_stat.st_mtime
-                        file.hash1 = file.hash2 = file.hash3 = None  # reset hashes
-                        file.done = False  # reset done flag
-                        updated.append(file)
-
-            for path, (path_stat, path_key) in table.items():
-                file = File(
-                    path=path,
-                    path_key=path_key,
-                    size=path_stat.st_size,
-                    mtime=path_stat.st_mtime
-                )
-                db.add(file)
-                created.append(file)
-
-            if not return_ids:
-                updated += created
-                created = []
-
-            if updated:
+        if updated or created:
+            with self._scoped_session() as db:
                 db.bulk_save_objects(updated, preserve_order=False)
-
-            if created:
                 db.bulk_save_objects(created, return_defaults=True, preserve_order=False)
-
-            if updated or created:
                 db.commit()
 
-            if return_ids and created:
-                # Fetch back the file ids
-                keys = [s for _, s in table.values()]
-                path_ids = db.query(File.path, File.id).filter(File.path_key.in_(keys)).all()
-                found_ids.update([t for s, t in path_ids if s in table])
+        if return_ids and created:
+            # Fetch back the file ids
+            keys = [s for _, s in table.values()]
+            path_ids = db.query(File.path, File.id).filter(File.path_key.in_(keys)).all()
+            found_ids.update([t for s, t in path_ids if s in table])
 
-            return found_ids
+        return found_ids
 
     async def _hash_files(self):
         hash_file = partial(fast_digests, blocksize=1024 ** 2, count=3)
