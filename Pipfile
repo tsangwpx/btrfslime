@@ -3,9 +3,6 @@ name = "pypi"
 url = "https://pypi.org/simple"
 verify_ssl = true
 
-[dev-packages]
-psutil = "~=5.7.2"
-
 [packages]
 # the following need commented when setting up the environment on Windows
 #btrfslime = { editable = true, path = "."}
