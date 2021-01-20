@@ -26,3 +26,6 @@ class lib:
     FIDEDUPERANGE: int
     FILE_DEDUPE_RANGE_DIFFERS: int
     FILE_DEDUPE_RANGE_SAME: int
+
+    @staticmethod
+    def ioctl(fd: int, request: int, *args: ffi.CData) -> int: ...

@@ -7,6 +7,7 @@ ffibuilder = FFI()
 ffibuilder.set_source('btrfslime._fs', r"""
 #include <linux/fs.h>
 #include <linux/fiemap.h>
+#include <sys/ioctl.h>
 """)
 
 ffibuilder.cdef(r"""
@@ -67,6 +68,8 @@ struct file_dedupe_range_info {
     uint32_t reserved;
 };
 
+// expose ioctl because fcntl.ioctl does NOT release GIL if the payload is greater than 1024 bytes
+int ioctl(int fd, unsigned long request, ...);
 """)
 
 if __name__ == '__main__':
