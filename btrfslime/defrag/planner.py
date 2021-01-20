@@ -11,8 +11,6 @@ from ..util import group_by_link, pairwise
 def _check_int_4096(name, value):
     if not isinstance(value, int):
         raise TypeError(f"'{name}' expects an int")
-    elif value <= 0:
-        raise ValueError(f"'{name}' expects a positive int")
     elif value % 4096 != 0:
         raise ValueError(f"'{name}' expects an int multiple of 4096")
 
@@ -22,21 +20,19 @@ def _check_int_4096(name, value):
 @dataclass
 class PlannerParams:
     extent_size: int
-    small_extent_size: int = None
-    large_extent_size: int = 128 * 1024 ** 2
-    shared_extent_size: int = None
-    tolerance: float = 0.1
+    small_extent_size: int
+    large_extent_size: int
+    shared_extent_size: int
+    tolerance: float  # range [0, 1]
 
     def __post_init__(self):
         self.extent_size = _check_int_4096('extent_size', self.extent_size)
-        if self.small_extent_size is None:
-            self.small_extent_size = self.extent_size
-        if self.shared_extent_size is None:
-            self.shared_extent_size = self.extent_size
-
         self.small_extent_size = _check_int_4096('small_extent_size', self.small_extent_size)
         self.large_extent_size = _check_int_4096('large_extent_size', self.large_extent_size)
         self.shared_extent_size = _check_int_4096('shared_extent_size', self.shared_extent_size)
+
+        if self.small_extent_size > self.large_extent_size:
+            raise ValueError('large extent size must be not less than small extent size')
 
 
 class Planner:
@@ -134,36 +130,41 @@ class Planner:
             # 1. Group fragmented extents by logical locations.
             # 2. Prepend and append adjacent extents if the group size smaller than extent_size parameter
             for group in group_by_link(fragmented[:], lambda a, b: contiguity[a] and a + 1 == b):
-                group_size = sum(extents[i].length for i in group)
+                group_size = sum([extents[i].length for i in group])
 
                 if group_size >= extent_size:
                     continue
 
                 prev_idx = group[0] - 1
-                if (
-                    prev_idx >= 0
-                    and contiguity[prev_idx]
+                next_idx = group[-1] + 1
+
+                while (
+                    group_size < extent_size
                     and prev_idx in unused
-                    and extents[prev_idx].length < extent_size
+                    and contiguity[prev_idx]
+                    and extents[prev_idx].length < extent_size  # do not touch the prev extent already in target size
                 ):
                     unused.remove(prev_idx)
                     fragmented.append(prev_idx)
+                    group_size += extents[prev_idx].length
                     adjusted = True
+                    prev_idx -= 1
 
-                next_idx = group[-1] + 1
-                if (
-                    contiguity[next_idx - 1]
+                while (
+                    group_size < extent_size
                     and next_idx in unused
+                    and contiguity[next_idx - 1]
                 ):
                     unused.remove(next_idx)
                     fragmented.append(next_idx)
+                    group_size += extents[next_idx].length
                     adjusted = True
+                    next_idx += 1
 
-            if adjusted:
-                fragmented.sort()
-                continue
-            else:
+            if not adjusted:
                 break
+
+            fragmented.sort()
 
         # Only return group with size >= 2
         return [
