@@ -5,6 +5,7 @@ import fcntl
 from typing import List, AnyStr, Union
 
 from ._fs import ffi, lib
+from .fs import ioctl
 
 __all__ = [
     'ExtentFlag',
@@ -178,7 +179,7 @@ def fiemap(file: Union[AnyStr, int], *, sync=False, xattr=False) -> List[Extent]
         else:
             ptr.fm_extent_count = extent_count
 
-        fcntl.ioctl(fd, lib.FS_IOC_FIEMAP, ffi.buffer(ptr))
+        ioctl(fd, lib.FS_IOC_FIEMAP, ptr)
 
         if extent_count != ptr.fm_mapped_extents:
             raise OSError('extent_count != mapped_extents. file is modified?')

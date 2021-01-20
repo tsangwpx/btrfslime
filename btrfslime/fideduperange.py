@@ -1,89 +1,196 @@
 from __future__ import annotations
 
 import dataclasses
-import fcntl
 import os
 from contextlib import ExitStack
 from dataclasses import dataclass
-from typing import AnyStr, List, Tuple, Union
+from typing import AnyStr, List, Tuple, Union, Sequence
 
 from ._fs import ffi, lib
+from .fs import build_error, ioctl
 from .util import check_nonnegative
 
 __all__ = ['fideduperange', 'dedupe_files', 'DedupeError', 'DedupeTask']
 
-SRC_SIZE = ffi.sizeof('struct file_dedupe_range')
-DST_SIZE = ffi.sizeof('struct file_dedupe_range_info')
-PAGE_SIZE = 4096
-DST_COUNT_MAX = (PAGE_SIZE - SRC_SIZE) // DST_SIZE  # The whole file_dedupe_range must be smaller than a page size, stated by the man page
+_ARG_SIZE = 1024  # Limit by fcntlmodules.c, and the file_dedupe_range struct must not greater than a page
+_INFO_LEN_MAX = (_ARG_SIZE - ffi.sizeof('struct file_dedupe_range')) // ffi.sizeof('struct file_dedupe_range_info')
+
+FILE_DEDUPE_RANGE_DIFFERS = lib.FILE_DEDUPE_RANGE_DIFFERS
+FILE_DEDUPE_RANGE_SAME = lib.FILE_DEDUPE_RANGE_SAME
 
 
 class DedupeError(OSError):
     bytes_deduped: int = 0
+    index: int = None
+    status: int = None
+
+    def __init__(self, *args, bytes_deduped: int = 0, index: int = None, status: int = None):
+        super().__init__(*args)
+        self.bytes_deduped = bytes_deduped
+        self.index = index
+        self.status = status
 
 
-def fideduperange(src_fd: int, src_offset: int, src_length: int, *args: int, chunksize: int = None) -> int:
+class DedupeHelper:
+    """
+    Reusable one destination deduplication helper
+
+    length should be <= 16MB because kernel may not support larger size.
+    """
+
+    def __init__(self, src_fd: int, src_offset: int, dst_fd: int, dst_offset: int, length: int):
+        self.src_fd = src_fd
+        self.argp = ffi.new('struct file_dedupe_range*', {
+            'dest_count': 1,
+            'info': 1,
+        })
+        self.src_fd = src_fd
+        self.src_offset = src_offset
+        self.dst_fd = dst_fd
+        self.dst_offset = dst_offset
+        self.length = length
+
+    @property
+    def src_offset(self) -> int:
+        return self.argp.src_offset
+
+    @src_offset.setter
+    def src_offset(self, offset: int):
+        self.argp.src_offset = offset
+
+    @property
+    def dst_fd(self) -> int:
+        return self.argp.info[0].dest_fd
+
+    @dst_fd.setter
+    def dst_fd(self, fd: int):
+        self.argp.info[0].dest_fd = fd
+
+    @property
+    def dst_offset(self) -> int:
+        return self.argp.info[0].dest_offset
+
+    @dst_offset.setter
+    def dst_offset(self, offset: int):
+        self.argp.info[0].dest_offset = offset
+
+    @property
+    def length(self) -> int:
+        return self.argp.src_length
+
+    @length.setter
+    def length(self, length: int):
+        self.argp.src_length = length
+
+    def dedupe(self) -> int:
+        """
+        :return: the number of bytes deduped
+        """
+        ret = ioctl(self.src_fd, lib.FIDEDUPERANGE, self.argp)
+        assert ret >= 0, ret
+        info = self.argp.info[0]
+
+        if info.status == lib.FILE_DEDUPE_RANGE_SAME:
+            return info.bytes_deduped
+
+        msg = None
+        if info.status == lib.FILE_DEDUPE_RANGE_DIFFERS:
+            msg = 'Data being deduplicated are different'
+
+        raise build_error(
+            -info.status if info.status < 0 else 0,
+            msg,
+            exc=DedupeError,
+            status=info.status,
+            bytes_deduped=info.bytes_deduped,
+            index=0,
+        )
+
+
+def fideduperange(
+    src_fd: int,
+    src_offset: int,
+    src_length: int,
+    dests: Sequence[Tuple[int, int]],
+    *,
+    chunksize: int = None,
+):
     check_nonnegative('src_fd', src_fd)
     check_nonnegative('src_offset', src_offset)
 
-    dst_count, error = divmod(len(args), 2)
+    if chunksize is None:
+        chunksize = 16 * 1024 ** 2  # 16 MB
 
-    if dst_count <= 0:
-        raise TypeError("dst_fd and dst_offset are required")
+    check_nonnegative('chunksize', chunksize)
 
-    if error:
-        raise TypeError("dst_fd and dst_offset must be present in pairs")
+    # Copy the dests
+    dests = [tuple(s) for s in dests]
 
-    if chunksize is not None and chunksize <= 0:
-        raise ValueError(f"'chunksize' must be positive")
-
-    dsts = [(i, s, t) for i, (s, t) in enumerate(zip(args[0::2], args[1::2]))]
-
-    for dst_index, dst_fd, dst_offset in dsts:
+    for dst_index, (dst_fd, dst_offset) in enumerate(dests):
         check_nonnegative('dst_fd', dst_fd)
         check_nonnegative('dst_offset', dst_offset)
 
+    batch_size = min(len(dests), _INFO_LEN_MAX)
     ptr = ffi.new('struct file_dedupe_range*', {
-        'info': min(dst_count, DST_COUNT_MAX),
+        'info': batch_size,
     })
-    pybuf = ffi.buffer(ptr)
 
+    # Group dests by batch size
+    batch_groups = []
+    for dest_start in range(0, len(dests), batch_size):
+        # Assign each dest an info
+        group = []
+        for dst_index, (dst_fd, dst_offset) in enumerate(dests[dest_start:dest_start + batch_size], dest_start):
+            group.append((dst_index, dst_fd, dst_offset, ptr.info[dst_index % batch_size]))
+        batch_groups.append(group)
+
+    file_dedupe_range_same = lib.FILE_DEDUPE_RANGE_SAME
+
+    left = src_length
     bytes_deduped = 0
-    while bytes_deduped < src_length:
-        bytes_deduped_loop = src_length - bytes_deduped
 
-        if chunksize is not None:
-            bytes_deduped_loop = min(bytes_deduped_loop, chunksize)
+    while left > 0:
+        # Repeatly dedupe until zero bytes left
+        task_size = min(chunksize, left)
+        task_deduped = task_size
 
-        for dst_group in [dsts[i:i + DST_COUNT_MAX] for i in range(0, dst_count, DST_COUNT_MAX)]:
-            ptr.src_offset = src_offset + bytes_deduped
-            ptr.src_length = bytes_deduped_loop
-            ptr.dest_count = len(dst_group)
+        ptr.src_offset = src_offset + bytes_deduped
+        ptr.src_length = task_size
 
-            for (dst_index, dst_fd, dst_offset), info in zip(dst_group, ptr.info):
+        for group in batch_groups:
+            ptr.dest_count = len(group)
+            for dst_index, dst_fd, dst_offset, info in group:
                 info.dest_fd = dst_fd
                 info.dest_offset = dst_offset + bytes_deduped
 
-            fcntl.ioctl(src_fd, lib.FIDEDUPERANGE, pybuf)
+            ret = ioctl(src_fd, lib.FIDEDUPERANGE, ptr)
+            assert ret == 0, ret
 
-            for (dst_index, dst_fd, dst_offset), info in zip(dst_group, ptr.info):
-                if info.status == lib.FILE_DEDUPE_RANGE_SAME:
-                    if info.bytes_deduped != bytes_deduped_loop:
-                        ex = DedupeError(
-                            f"Unexpected number of bytes deduped in dest {dst_index} "
-                            f"(offset={info.dest_offset}, bytes_deuped={info.bytes_deduped} != {bytes_deduped_loop})"
-                        )
-                        ex.bytes_deduped = info.bytes_deduped
-                        raise
+            for dst_index, dst_fd, dst_offset, info in group:
+                if info.bytes_deduped < task_deduped:
+                    task_deduped = info.bytes_deduped
+
+                if info.status == file_dedupe_range_same:
                     continue
-                elif info.status == lib.FILE_DEDUPE_RANGE_DIFFERS:
-                    ex = DedupeError(f"Failed to dedupe dest {dst_index} ({info.dest_offset} + {info.bytes_deduped})")
-                    ex.bytes_deduped = info.bytes_deduped
-                    raise ex
-                else:
-                    raise AssertionError(f"Unknown status code {info.status}")
 
-        bytes_deduped += bytes_deduped_loop
+                if dst_index + 1 == len(dests):
+                    # increase the total bytes deduped if this is the last dest
+                    bytes_deduped += info.bytes_deduped
+
+                raise DedupeError(
+                    info.status,
+                    f"Error {info.status} caused by dest {dst_index}",
+                    bytes_deduped=bytes_deduped,
+                    status=info.status,
+                    index=dst_index,
+                )
+
+        assert task_deduped > 0 and task_deduped == task_size, (task_size, task_deduped)
+        assert task_deduped <= left, (task_deduped, left)
+
+        bytes_deduped += task_deduped
+        left -= task_deduped
+    assert bytes_deduped == src_length and left == 0, (bytes_deduped, left, src_length)
 
     return bytes_deduped
 
@@ -107,12 +214,12 @@ class DedupeTask:
             if src_length is None:
                 src_length = os.stat(src_fd).st_size
 
-            args = []
+            dests = []
             for target, target_offset in self.targets:
                 dst_fd = stack.enter_context(open(target, 'r+b', closefd=not isinstance(target, int))).fileno()
-                args.extend((dst_fd, target_offset))
+                dests.append((dst_fd, target_offset))
 
-            return fideduperange(src_fd, src_offset, src_length, *args, chunksize=self.chunksize)
+            return fideduperange(src_fd, src_offset, src_length, dests, chunksize=self.chunksize)
 
 
 def dedupe_files(src: AnyStr, dests: List[AnyStr]):
