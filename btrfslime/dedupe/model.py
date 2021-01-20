@@ -15,7 +15,7 @@ class File(Base):
     # because SQLite store a copy of the column values in the index and path length is usually larger than 32
     # currently SHA1 is overkill choice
     path = Column(Unicode, nullable=False)
-    path_key = Column(LargeBinary(32), nullable=False, index=True)
+    path_key = Column(Integer, nullable=False, index=True)
 
     size = Column(BigInteger, nullable=False, index=True)
     mtime = Column(Float, nullable=False)  # stat_result.st_mtime is a float
@@ -29,13 +29,11 @@ class File(Base):
     done = Column(Boolean, nullable=False, default=False)
 
     def __repr__(self):
-        digests = []
-        if self.hash1:
-            digests.append(self.hash1[:4].hex())
+        hash_str = ','.join([s[:3].hex() if s is not None else '______' for s in (self.hash1, self.hash2, self.hash3)])
+        return f'<File {self.path!r} size {self.size} hash {hash_str}>'
 
-        if self.hash2:
-            digests.append(self.hash2[:4].hex())
 
-        hashes = ' '.join(digests)
+class MissingId(Base):
+    __tablename__ = 'missing_ids'
 
-        return f'<File {self.path!r} size {self.size} hash {hashes}>'
+    id = Column(Integer, primary_key=True)

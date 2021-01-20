@@ -3,28 +3,33 @@ from __future__ import annotations
 import asyncio
 import bisect
 import collections
-import concurrent.futures
 import contextlib
+import dataclasses
 import hashlib
 import itertools
 import logging
-import operator
 import os
-import os.path
+import threading
+import time
+from argparse import ArgumentParser
+from concurrent.futures.thread import ThreadPoolExecutor
 from contextlib import ExitStack
+from dataclasses import dataclass
 from functools import partial, lru_cache
+from operator import attrgetter
 from sqlite3 import sqlite_version_info
-from typing import List, Tuple, Set, ContextManager, AnyStr, Iterator, Sequence, Optional, Dict
+from typing import List, Tuple, Set, ContextManager, AnyStr, Sequence, Optional, Dict, Callable, Awaitable
 
-from sqlalchemy import create_engine, func
-from sqlalchemy.orm import sessionmaker, Session, Query
-from sqlalchemy.sql import select
+from sqlalchemy import create_engine
+from sqlalchemy.event import listens_for
+from sqlalchemy.orm import Session, sessionmaker
 from tqdm import tqdm
 
 from .hashing import salted_algo
-from .model import Base, File
-from ..async_util import executor_run_many
-from ..fideduperange import DedupeTask, DedupeError
+from .model import Base, File, MissingId
+from .. import _xxhash
+from ..async_util import pull_tasks
+from ..fideduperange import DedupeError, FILE_DEDUPE_RANGE_DIFFERS, DedupeHelper
 from ..fiemap import Extent, ExtentFlag, fiemap
 from ..scantree import ExecutorTreeScanner, iterate_files
 from ..util import chunkize
@@ -33,23 +38,40 @@ from ..util import chunkize
 _SAFE_VARIABLE_NUMBER = 950 if sqlite_version_info < (3, 32, 0) else 32000
 
 
-def path_digest(s: str) -> bytes:
-    h = salted_algo(hashlib.sha256)
-    h.update(s.encode('utf-16-be'))
-    return h.digest()
+@dataclass
+class _DedupeTuple:
+    path_index: int
+    path: str
+    fd: int
+    size: int
+    extents: List[Extent] = dataclasses.field(repr=False)
+    extent_keys: List[int] = dataclasses.field(repr=False)
 
 
-def key_by_extents(extents: List[Extent]):
-    """Sort files according to the distribution of their extents"""
+def _path_key(s: str) -> int:
+    """Hash a str to an int"""
+    encoded = s.encode('utf-16-be', 'surrogateescape')
+    return _xxhash.lib.calc_key(encoded, len(encoded))
+
+
+def _extent_distribution_key(extents: List[Extent]):
+    """Sort key according to extent distribution"""
+
+    attr_length: Callable[..., int] = attrgetter('length')
+    shared_flag = ExtentFlag.SHARED
+    shared_extents = [e for e in extents if shared_flag in e.flags]
+    shared_size = sum(map(attr_length, shared_extents))
+    avg_shared_size = shared_size / len(shared_extents) if shared_extents else 0
+
     return (
-        len(extents),  # less extents is better
-        -sum(1 for e in extents if ExtentFlag.SHARED in e.flags),  # more shared extents are better
-        -min(e.length for e in extents),  # larger is better
-        -max(e.length for e in extents),  # larger is better
+        -shared_size,  # larger is better
+        -avg_shared_size,  # larger is better
+        len(extents),  # less is better
+        -min(map(attr_length, extents)),  # larger least extent is better
     )
 
 
-def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int = 2) -> Tuple[List[List[int]], Set[int]]:
+def _group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int = 2) -> Tuple[List[List[int]], Set[int]]:
     """
     Implement a modified DBSCAN to group files into clusters
 
@@ -62,7 +84,7 @@ def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int 
     :param minimum should be 2
     """
     total = len(hashes)
-    assigned: Set[int] = set()
+    assigned: List[int] = [False] * total
     clusters: List[List[int]] = []
     noises = set()
 
@@ -80,7 +102,7 @@ def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int 
         return [q for q in range(total) if (same_file(p, q) if p <= q else same_file(q, p))]
 
     for i in range(total):
-        if i in assigned:  # This file has been assigned a group
+        if assigned[i]:  # Skip assigned index
             continue
 
         neighbors = find_neighbors(i)
@@ -88,18 +110,18 @@ def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int 
             noises.add(i)
             continue
 
-        assigned.add(i)
+        assigned[i] = True
         group = [i]
         clusters.append(group)
 
-        pending = collections.deque([s for s in neighbors if s not in assigned])
+        pending = collections.deque([s for s in neighbors if not assigned[s]])
 
         while pending:
             j = pending.popleft()
-            if j in assigned:  # This file has been assigned a group
+            if assigned[j]:  # Skip assigned index
                 continue
 
-            assigned.add(j)
+            assigned[j] = True
             group.append(j)
 
             if j in noises:
@@ -109,17 +131,15 @@ def group_by_hashes(hashes: Sequence[Tuple[bytes, ...]], eps: int, minimum: int 
             neighbors = find_neighbors(j)
             if len(neighbors) < minimum:
                 continue
-            pending.extend([s for s in neighbors if s not in assigned])
-
-        # print('New group: %s' % (sorted(group),))
+            pending.extend([s for s in neighbors if not assigned[s]])
 
     return clusters, noises
 
 
-def fast_digests(path: AnyStr, blocksize: int, count: int) -> List[bytes]:
+def _compute_hashes(path: AnyStr, blocksize: int, count: int) -> List[bytes]:
     hashes: List[Optional[bytes]] = [None] * count
 
-    with open(path, 'rb') as f:
+    with open(path, 'rb', buffering=0) as f:
         size = os.stat(f.fileno()).st_size
         step = max(blocksize, size // blocksize // (count + 1) * blocksize)  # align step to blocksize
 
@@ -144,26 +164,34 @@ class Runner:
         db_file: str,
         skip_scan: bool = False,
         skip_hash: bool = False,
+        skip_dedupe: bool = False,
         reset_done: bool = False,
-        purge_missing: bool = True,
+        reset_hash: bool = False,
     ):
         self.logger = logging.getLogger(__name__)
         self.roots = roots
         self.db_file = db_file
         self.skip_scan = skip_scan
         self.skip_hash = skip_hash
+        self.skip_dedupe = skip_dedupe
         self.reset_done = reset_done
-        self.purge_missing = purge_missing
+        self.reset_hash = reset_hash
+        self.file_size_min = 4096
 
-        # for heavy io
-        self._io_executor = concurrent.futures.ThreadPoolExecutor(4)
+        self.__key_conflicts = 0
+
+        # Number of workers
+        self.scan_workers = 4
+        self.hash_workers = 2
+        self.dedupe_workers = 2
 
         self._init_database()
 
     def _init_database(self):
-        self._engine = create_engine(f'sqlite:///{self.db_file}')
-
-        from sqlalchemy.event import listens_for
+        self._engine = create_engine(
+            f'sqlite:///{self.db_file}?timeout=60',
+            # echo=True,
+        )
 
         @listens_for(self._engine, 'connect')
         def set_sqlite_pragma(connection, connection_record):
@@ -175,92 +203,105 @@ class Runner:
         self._session_cls = sessionmaker(bind=self._engine)
 
     @contextlib.contextmanager
-    def _scoped_session(self) -> ContextManager[Session]:
-        db = self._session_cls()
+    def _scoped_session(self, **kwargs) -> ContextManager[Session]:
+        kwargs.setdefault('expire_on_commit', False)  # Disable auto load after flush
+        db: Session = self._session_cls(**kwargs)
         try:
             yield db
         finally:
             db.close()
 
-    async def _scan_files(self):
-        missing_ids = set()
-        if self.purge_missing:
-            # Load all file ids for purging purpose
-            with self._scoped_session() as db, tqdm(desc='load database', unit='') as pbar:
-                pbar.refresh()
+    def _progress_bar(self, **kwargs):
+        kwargs.setdefault('mininterval', 0.5)
+        kwargs.setdefault('maxinterval', 60)
+        kwargs.setdefault('miniters', 1)
+        kwargs.setdefault('smoothing', 0.1)
 
-                itemgetter = operator.itemgetter(0)
-                result = db.execute(select([File.id]))
-                for chunk in iter(lambda: result.fetchmany(10000), []):
-                    pbar.update(len(chunk))
-                    missing_ids.update(map(itemgetter, chunk))
+        return tqdm(**kwargs)
 
-                pbar.refresh()
+    async def _do_scan(self):
+        from sqlalchemy import delete, insert
 
-        # Update the database according to existing files
-        return_ids = len(missing_ids) > 0 and self.purge_missing
+        with ExitStack() as exit_stack:
+            db = exit_stack.enter_context(self._scoped_session())
 
-        with ExecutorTreeScanner(executor=self._io_executor) as scanner, tqdm(total=len(missing_ids), desc='scan files', unit='') as pbar:
+            # Setup missing id table
+            db.execute(delete(MissingId))
+            db.execute(insert(MissingId).from_select([File.id], db.query(File.id).subquery()))
+            db.commit()
+
+            # io-intensive executor
+            scan_executor = exit_stack.enter_context(ThreadPoolExecutor(self.scan_workers))
+            scanner = exit_stack.enter_context(ExecutorTreeScanner(executor=scan_executor))
+
+            file_count = db.query(File).count()
+            pbar = exit_stack.enter_context(self._progress_bar(total=file_count, desc='scanning', unit=''))
             pbar.refresh()
 
-            def finish_callback(found_ids, task_id, stat_list):
-                missing_ids.difference_update(found_ids)
-                pbar.update(len(stat_list))
+            # General executor to bridge sync and async functions
+            executor_run = partial(asyncio.get_running_loop().run_in_executor, None)
 
-            task_iterator = iter(chunkize(iterate_files(self.roots, scanner=scanner), _SAFE_VARIABLE_NUMBER))
-            task_counter = itertools.count()
-            # Distribute the database update to multiple threads
-            await executor_run_many(
-                partial(self._scan_files_inner, return_ids=return_ids),
-                task_counter,
-                task_iterator,
-                workers=2,
-                onfinish=finish_callback,
-            )
+            async def produce():
+                sentinel = object()
+                it = chunkize(iterate_files(self.roots, scanner=scanner), _SAFE_VARIABLE_NUMBER)
+
+                for task_id in itertools.count():
+                    batch: List[Tuple[str, os.stat_result]]
+                    batch = await executor_run(next, it, sentinel)
+                    if batch is sentinel:
+                        break
+                    yield task_id, batch
+
+            def consume(work) -> Awaitable:
+                task_id, batch = work
+                return executor_run(self._scan_batch, task_id, batch)
+
+            # use 2 workers due to SQLite
+            async for result in pull_tasks(produce(), consume, 2):
+                pbar.update(result)
 
             pbar.total = pbar.n
             pbar.refresh()
 
-        if self.purge_missing:
-            # Remove missing files
-            with self._scoped_session() as db, tqdm(len(missing_ids), desc='purge missing', unit='') as pbar:
-                for chunk_ids in chunkize(missing_ids, _SAFE_VARIABLE_NUMBER):
-                    db.query(File).filter(File.id.in_(chunk_ids)).delete(
-                        synchronize_session=False,
-                    )
-                    pbar.update(len(chunk_ids))
-                db.commit()
-                pbar.refresh()
+            pbar.set_description('finishing')
 
-    def _scan_files_inner(self, task_id: int, stat_list: List[Tuple[str, os.stat_result]], return_ids: bool) -> Set[int]:
+            db.execute(delete(File).where(File.id.in_(db.query(MissingId.id).subquery())))
+            db.execute(delete(MissingId))
+            db.commit()
+
+            self.logger.debug('Key conflict rate %d/%d (%.1f%%)', self.__key_conflicts, pbar.total, self.__key_conflicts / pbar.total * 100)
+
+    def _scan_batch(self, task_id: int, stat_list: List[Tuple[str, os.stat_result]]) -> int:
         """
+        Add / update rows into the database according to the stat list
 
-        :param task_id:
-        :param stat_list:
-        :param return_ids: whether return the ids of the existing files in the database
-        :return: a set of file ids or an empty set if return_ids is falsy
+        :param task_id: for debug purpose
+        :param stat_list: a list of (path, os.stat_result) tuples
+        :return: the number of found files == len(stat_list)
         """
-        table: Dict[str, Tuple[os.stat_result, bytes]] = {s: (t, path_digest(s)) for s, t in stat_list}
-        keys: List[bytes] = [t for _, t in table.values()]
-        found_ids = set()
+        file_size_min = self.file_size_min
+        table: Dict[str, Tuple[os.stat_result, int]] = {
+            s: (t, _path_key(s)) for s, t in stat_list if t.st_size >= file_size_min
+        }
+        keys: List[int] = [t for _, t in table.values()]
 
-        updated = []
-        created = []
+        existing_ids: List[int] = []
+        changes: List[File] = []
 
-        if return_ids:
-            # According to EXPLAIN QUERY PLAN, filter by (path, digest) tuple did NOT use the digest index
-            # so use the simple IN filtering plus a Python dict to balance time and (disk) space.
-            with self._scoped_session() as db:
-                files: List[File] = db.query(File).filter(File.path_key.in_(keys)).all()
+        # According to EXPLAIN QUERY PLAN, filter by (path, path_key) tuple did NOT use the path_key index
+        # so use the simple IN filtering plus a Python dict to balance time and (disk) space.
+        with self._scoped_session() as db:
+            files: List[File] = db.query(File).filter(File.path_key.in_(keys)).all()
+            db.expunge_all()
 
             for file in files:
                 try:
                     path_stat, _ = table.pop(file.path)
                 except KeyError:
-                    self.logger.debug('Path %r is missing, duplicate hash? %r', file.path, file.path_key.hex())
+                    self.__key_conflicts += 1
                     continue
                 else:
-                    found_ids.add(file.id)
+                    existing_ids.append(file.id)
 
                     if file.size == path_stat.st_size and file.mtime == path_stat.st_mtime:
                         # Skip unchanged entry
@@ -270,270 +311,468 @@ class Runner:
                     file.mtime = path_stat.st_mtime
                     file.hash1 = file.hash2 = file.hash3 = None  # reset hashes
                     file.done = False  # reset done flag
-                    updated.append(file)
+                    changes.append(file)
 
-        for path, (path_stat, path_key) in table.items():
-            file = File(
-                path=path,
-                path_key=path_key,
-                size=path_stat.st_size,
-                mtime=path_stat.st_mtime
-            )
-            db.add(file)
-            created.append(file)
+            for path, (path_stat, path_key) in table.items():
+                file = File(
+                    path=path,
+                    path_key=path_key,
+                    size=path_stat.st_size,
+                    mtime=path_stat.st_mtime,
+                )
+                changes.append(file)
 
-        if not return_ids:
-            updated += created
-            created = []
+            db.bulk_save_objects(changes, preserve_order=False)
+            db.query(MissingId).filter(MissingId.id.in_(existing_ids)).delete(synchronize_session=False)
+            db.commit()
 
-        if updated or created:
-            with self._scoped_session() as db:
-                db.bulk_save_objects(updated, preserve_order=False)
-                db.bulk_save_objects(created, return_defaults=True, preserve_order=False)
-                db.commit()
+        return len(stat_list)
 
-        if return_ids and created:
-            # Fetch back the file ids
-            keys = [s for _, s in table.values()]
-            path_ids = db.query(File.path, File.id).filter(File.path_key.in_(keys)).all()
-            found_ids.update([t for s, t in path_ids if s in table])
+    async def _do_hash(self):
+        from sqlalchemy import func
 
-        return found_ids
+        hash_file = partial(_compute_hashes, blocksize=1024 ** 2, count=3)
 
-    async def _hash_files(self):
-        hash_file = partial(fast_digests, blocksize=1024 ** 2, count=3)
-        executor_run = partial(asyncio.get_running_loop().run_in_executor, None)
-        subquery = Query(File.size).group_by(File.size).having(func.count() >= 2).subquery()
-        query: Query = Query(File).filter(
-            File.size.in_(subquery),
-            File.hash1.is_(None),
-            # the above condition is enough to find un-hashed entries
-            # File.hash1.is_(None) | ((File.size >= _SIZE2M) & File.hash2.is_(None)) | ((File.size >= _SIZE3M) & File.hash3.is_(None)),
-        )
-        self.logger.debug('_hash_changed_files: SQL=%s', str(query))
+        with ExitStack() as exit_stack:
+            db = exit_stack.enter_context(self._scoped_session())
 
-        with self._scoped_session() as db:
-            total = query.with_session(db).count()
+            executor = exit_stack.enter_context(ThreadPoolExecutor(self.hash_workers))
+            executor_run = partial(asyncio.get_running_loop().run_in_executor, executor)
 
-        query = query.limit(1000)
+            subquery = (db.query(File.size)
+                        .filter(File.size >= self.file_size_min)
+                        .group_by(File.size)
+                        .having(func.count() >= 2)
+                        .subquery())
 
-        with tqdm(total=total, desc='hashing', unit='') as pbar:
+            total = db.query(File).filter(
+                File.size.in_(subquery),
+                File.hash1.is_(None),
+                # the above condition is enough to find un-hashed entries
+                # File.hash1.is_(None) | ((File.size >= _SIZE2M) & File.hash2.is_(None)) | ((File.size >= _SIZE3M) & File.hash3.is_(None)),
+            ).count()
+
+            pbar = exit_stack.enter_context(self._progress_bar(total=total, desc='hashing', unit=''))
             pbar.refresh()
 
-            pending = []
+            async def produce():
+                minimum_id: int = 0
 
-            def generator():
                 while True:
-                    with self._scoped_session() as db_:
-                        files_ = query.with_session(db_).all()
-                    if files_:
-                        yield from files_
-                    else:
+                    work = db.query(File).filter(
+                        File.id >= minimum_id,
+                        File.size.in_(subquery),
+                        File.hash1.is_(None),
+                    ).order_by(
+                        File.id,
+                    ).limit(1000).all()
+                    db.expunge_all()
+
+                    if not work:
                         break
 
-            def onfinish(hashes, file):
-                file.hash1, file.hash2, file.hash3 = hashes
-                file.done = False
-                pending.append(file)
+                    for item in work:
+                        yield item
 
-            def onerror(exc, file):
-                file.hash1 = file.hash2 = file.hash3 = None
-                file.done = False
-                pending.append(file)
+                    # noinspection PyTypeChecker
+                    minimum_id = max(map(attrgetter('id'), work)) + 1
 
-                if isinstance(exc, (FileNotFoundError, PermissionError)):
-                    self.logger.info('Failed to hash %s due to %s', file.path, type(exc).__name__)
-                    return
-                raise
-
-            def update_database(files):
-                with self._scoped_session() as db_:
-                    db_.bulk_save_objects(files, preserve_order=False)
-                    db_.commit()
-
-            task = asyncio.create_task(executor_run_many(
-                lambda file: hash_file(file.path),
-                generator(),
-                onfinish=onfinish,
-                onerror=onerror,
-                workers=1,
-                executor=self._io_executor,
-            ))
-
-            fs = {task}
-
-            while fs:
-                done, _ = await asyncio.wait(fs, timeout=2)
-                fs.difference_update(done)
-
-                for fut in done:
-                    await fut
-
-                if pending:
-                    pbar.update(len(pending))
-                    # send the list to executor and re-create one
-                    fs.add(executor_run(update_database, pending))
-                    pending = []
-
-            pbar.refresh()
-
-    def _dedupe_file_group(self, task_id: int, paths: List[str]):
-        """
-        Given a list of paths, sort them using their extent distribution
-        Choose the good-looking as the source file
-
-        :param task_id a friendly number for logging
-        :param paths a list of file names to dedupe
-        """
-        unknown_flags = ~(ExtentFlag.LAST | ExtentFlag.ENCODED | ExtentFlag.ENCRYPTED | ExtentFlag.SHARED)
-        attr_logical = operator.attrgetter('logical')
-
-        with ExitStack() as stack:
-            # store valid paths and their relatives in a list of quadruplets
-            quadruplets = []  # (path, fd, extents, extent_keys)
-
-            for path in paths:
+            async def consume(file_: File):
                 try:
-                    fd = stack.enter_context(open(path, 'r+b')).fileno()
+                    file_.hash1, file_.hash2, file_.hash3 = await executor_run(hash_file, file_.path)
                 except (FileNotFoundError, PermissionError) as ex:
-                    self.logger.warning('Inaccessible path: %s', str(ex))
-                    continue
+                    self.logger.error('hash error: %s', ex)
+                    file_ = None
 
-                extents = fiemap(fd)
-                bad_flags = next((unknown_flags & e.flags for e in extents), 0)
-                if bad_flags:
-                    self.logger.info(
-                        'Ignore %r with unsupported flags %r',
-                        bad_flags,
-                    )
-                    continue
+                pbar.update()
+                return file_
 
-                extents.sort(key=attr_logical)
-                extent_keys = list(map(attr_logical, extents))
-                quadruplets.append((path, fd, extents, extent_keys))
+            def save_pending():
+                if not pending:
+                    return
 
-            if len(quadruplets) <= 1:
-                return
+                db.bulk_save_objects(pending, preserve_order=False)
+                db.commit()
+                pending.clear()
 
-            # Sort paths by extent distribution
-            quadruplets.sort(key=lambda s: key_by_extents(s[2]))
-            src_path, src_fd, src_extents, _ = quadruplets[0]
-            size = os.fstat(src_fd).st_size
+            pending = collections.deque()
+            timeout = time.monotonic() + 30  # every 30 seconds
+            threshold = _SAFE_VARIABLE_NUMBER // 4  # Columns: id, hash1, hash2, hash3
 
-            for extent in src_extents:
-                dedupe_pairs = []  # (path, fd)
+            async for file in pull_tasks(produce(), consume, self.hash_workers + 1):
+                if file:
+                    pending.append(file)
 
-                for dst_path, dst_fd, dst_extents, dst_extent_keys in quadruplets[1:]:
-                    extent_index = bisect.bisect_left(dst_extent_keys, extent.logical)
-                    if extent_index < len(dst_extents) and dst_extents[extent_index] == extent:
-                        # Skip file with the same physical extent
-                        continue
-                    dedupe_pairs.append((dst_path, dst_fd))
+                if len(pending) >= threshold or time.monotonic() >= timeout:
+                    save_pending()
+                    timeout = time.monotonic() + 30
 
-                if not dedupe_pairs:
-                    continue
+            save_pending()
 
-                dedupe_offset = extent.logical
-                left = size - dedupe_offset if ExtentFlag.LAST in extent.flags else extent.length
-                chunksize = 1024 ** 2  # 1MB
+    async def _do_dedupe(self):
+        from sqlalchemy import func
 
-                while left > 0:
-                    dedupe_size = min(chunksize, left)
-                    task = DedupeTask(src_fd, offset=dedupe_offset, length=dedupe_size)
+        with ExitStack() as exit_stack:
+            db: Session = exit_stack.enter_context(self._scoped_session())
 
-                    for _, fd in dedupe_pairs:
-                        task.add_target(fd, dedupe_offset)
+            executor = exit_stack.enter_context(ThreadPoolExecutor(self.dedupe_workers))
+            executor_run = partial(asyncio.get_running_loop().run_in_executor, executor)
 
-                    try:
-                        bytes_deduped = task.dedupe()
-                    except DedupeError as ex:
-                        bytes_deduped = ex.bytes_deduped
-                        self.logger.warning(
-                            'task %d unequal data at offset %d size %d',
-                            task_id, dedupe_offset, dedupe_size,
-                        )
+            # Find same-size groups which their member files are updated / unprocessed
+            counts_and_sizes = (db.query(func.count(), File.size)
+                                .filter(File.size >= self.file_size_min, File.hash1.isnot(None))
+                                .group_by(File.size)
+                                .having((func.count() >= 2) & (func.count() != func.sum(File.done)))
+                                .all())
 
-                    dedupe_offset += dedupe_size
-                    left -= dedupe_size
+            total_size = sum([count * size for count, size in counts_and_sizes])
+            all_sizes = [s for _, s in counts_and_sizes]
+            all_sizes.sort(reverse=True)
 
-    async def _dedupe_files(self):
-        # Find same-size groups which their member files are updated / unprocessed
-        with self._scoped_session() as session:
-            q = (session.query(func.count(), File.size)
-                 .filter(File.size > 0, File.hash1.isnot(None))
-                 .group_by(File.size)
-                 .having((func.count() >= 2) & (func.count() != func.sum(File.done))))
-            counts_and_sizes = q.all()
-
-        total = sum([s for s, _ in counts_and_sizes])
-        sizes = [s for _, s in counts_and_sizes]
-
-        with tqdm(total=total, desc='progress', unit='') as pbar:
+            pbar = exit_stack.enter_context(self._progress_bar(total=total_size, desc='progress', unit='B', unit_scale=True, unit_divisor=1024))
             pbar.refresh()
 
-            def commit_files(files: List[File]):
-                for f in files:
-                    f.done = True
+            async def produce():
+                task_id = 0
 
-                with self._scoped_session() as db:
-                    db.bulk_save_objects(files, preserve_order=False)
-                    db.commit()
+                for group_size in all_sizes:
+                    files = (db.query(File)
+                             .filter(File.size == group_size)
+                             .order_by(File.path)  # better ordering
+                             .all())
+                    db.expunge_all()
 
-                pbar.update(len(files))
-
-            def generate_tasks() -> Iterator[List[File]]:
-                for group_size in sizes:
-                    # Fetch files of a size group
-                    with self._scoped_session() as db:
-                        files = db.query(File).filter(File.size == group_size).all()
-
-                    # If file size >= 3MB, require 2 identical hashes. otherwise, 1 hash is enough.
-                    min_hashes = 2 if group_size >= 3 * 1024 ** 2 else 1
-
+                    # block size is 1MB, so require 2 identical hashes for files not less than 3MB
+                    same_hash_min = 2 if group_size >= 3 * 1024 ** 2 else 1
                     hashes = [(s.hash1, s.hash2, s.hash3) for s in files]
-                    clusters, noises = group_by_hashes(hashes, min_hashes)
+
+                    clusters, noises = _group_by_hashes(hashes, same_hash_min)
 
                     if noises:
-                        commit_files([files[s] for s in noises])
+                        pending.extend([files[s] for s in noises])
+                        pbar.total -= len(noises) * group_size
+                        pbar.refresh()
 
-                    for group_ids in clusters:
-                        yield [files[s] for s in group_ids]
+                    for group in clusters:
+                        yield task_id, group_size, [files[s] for s in group]
+                        task_id += 1
 
-            def dedupe_files(task_id, files):
-                self._dedupe_file_group(task_id, [s.path for s in files])
-                commit_files(files)
+            async def consume(work):
+                task_id, group_size, files = work
+                try:
+                    deduped_bytes = await executor_run(self._dedupe_group, task_id, event, [s.path for s in files])
+                except Exception as ex:
+                    self.logger.error('task %d error: %s', task_id, ex)
 
-            task_counter = itertools.count()
+                    # Ignore OSError
+                    if not isinstance(ex, OSError):
+                        raise
 
-            await executor_run_many(
-                dedupe_files,
-                task_counter,
-                generate_tasks(),
-                workers=2,
-                executor=self._io_executor,
+                    # Do not add them to pending
+                    deduped_bytes = 0
+                    pbar.total -= len(files) * group_size
+                    pbar.refresh()
+                else:
+                    pending.extend(files)
+                    pbar.update(len(files) * group_size)
+
+                return deduped_bytes
+
+            def save_pending():
+                if not pending:
+                    return
+
+                for file in pending:
+                    file.done = True
+
+                db.bulk_save_objects(pending, preserve_order=False)
+                db.commit()
+                pending.clear()
+
+            event = threading.Event()  # just a mutable object (use list is fine)
+            pending = collections.deque()
+            threshold = 100
+            timeout = time.monotonic() + 30
+            total_bytes_deduped = 0
+
+            try:
+                async for bytes_deduped in pull_tasks(produce(), consume, self.dedupe_workers):
+                    total_bytes_deduped += bytes_deduped
+
+                    if len(pending) >= threshold or time.monotonic() >= timeout:
+                        save_pending()
+                        timeout = time.monotonic() + 30
+
+                save_pending()
+
+                self.logger.info('deduped %.1f MB', total_bytes_deduped / 1024 ** 2)
+            finally:
+                event.set()
+
+    def _dedupe_open_file(self, task_id, path_index: int, path: str) -> Optional[_DedupeTuple]:
+        """
+        Open a path for read-write and return a _DedupleTupel if succeed or None if error is silenced.
+
+        :param task_id: task id
+        :param path_index: path index
+        :param path: path
+        """
+        attr_logical: Callable[..., int] = attrgetter('logical')
+
+        dt = None
+        fd = os.open(path, os.O_RDWR | os.O_NOATIME | os.O_CLOEXEC)
+
+        try:
+            extents = fiemap(fd)
+            extents.sort(key=attr_logical)
+
+            if not extents:
+                self.logger.info('task %d path %d is ignored due to zero extents', task_id, path_index)
+                return
+
+            if ExtentFlag.LAST not in extents[-1].flags:
+                self.logger.info('task %d path %d is ignored due to lack of LAST flag', task_id, path_index)
+                return
+
+            # Make sure the file is continuous
+            expect_logical = 0
+
+            # Path with bad extent flags are reported and skipped
+            bad_flags = ~(ExtentFlag.LAST | ExtentFlag.SHARED)
+
+            for ext in extents:
+                if expect_logical != ext.logical:
+                    self.logger.info('task %d path %d is ignored due to discontinuity at %d', task_id, path_index, expect_logical)
+                    return
+
+                bad_flags = bad_flags & ext.flags
+                if bad_flags:
+                    self.logger.info('task %d path %d is ignored due to bad flags %r at %d', task_id, path_index, bad_flags, ext.logical)
+                    return
+
+                expect_logical = ext.logical_stop
+
+            last_extent = extents[-1]
+            size = os.fstat(fd).st_size
+            assert last_extent.logical < size <= last_extent.logical_stop, (size, last_extent)
+
+            extent_keys = list(map(attr_logical, extents))
+            dt = _DedupeTuple(
+                path_index=path_index,
+                path=path,
+                fd=fd,
+                size=size,
+                extents=extents,
+                extent_keys=extent_keys,
             )
+            return dt
+        finally:
+            if dt is None and fd >= 0:
+                # Something wrong
+                os.close(fd)
 
-            pbar.refresh()
+    def _dedupe_extent(self, task_id: int, event: threading.Event, null_fd: int, extent: Extent, src: _DedupeTuple, dst: _DedupeTuple) -> int:
+        """
+        Dedupe an Extent and return the number of bytes deduped
+
+        Note that the returned number may be smaller than the extent size
+        """
+
+        offset = extent.logical
+        seek_end = True
+
+        if seek_end:
+            # Adjust the offset by avoiding physical overlapping
+            # Find a sub-extent from dst extents contained in the src extent
+            # There are at least two possible sub-extent choices:
+            # 1. The sub-extent aligned with the start of the source extent. (Safe)
+            # 2. Last sub-extent possibly represents the last interrupted deduplication location. (Faster, usually accurate, current implementation)
+            subextent = None
+            ext_index = bisect.bisect_left(dst.extent_keys, extent.logical)
+            for ext in dst.extents[ext_index:]:
+                if ext.logical >= ext.logical_stop:  # out of range
+                    break
+                if extent.physical < ext.physical_stop <= extent.physical_stop:
+                    subextent = ext
+
+            if subextent:
+                assert extent.logical <= subextent.logical < extent.logical_stop
+
+                # Use the end of the sub-extent as offset
+                offset = src.size if ExtentFlag.LAST in subextent.flags else subextent.logical_stop
+
+        # If LAST flag present, the valid data size <= the extent size
+        length = src.size - offset if ExtentFlag.LAST in extent.flags else extent.logical_stop - offset
+        assert length >= 0
+
+        if not length:
+            return 0
+
+        chunksize = chunksize_max = 8 * 1024 ** 2
+        chunksize_min = 1 * 1024 ** 2
+        helper = DedupeHelper(src.fd, offset, dst.fd, offset, length)
+        left = length
+
+        os.posix_fadvise(src.fd, offset, left, os.POSIX_FADV_SEQUENTIAL)
+        os.posix_fadvise(dst.fd, offset, left, os.POSIX_FADV_SEQUENTIAL)
+
+        while left > 0:
+            if event.is_set():
+                break
+
+            advise_size = min(left, chunksize * 2)
+            os.posix_fadvise(src.fd, offset, advise_size, os.POSIX_FADV_WILLNEED)
+            os.posix_fadvise(dst.fd, offset, advise_size, os.POSIX_FADV_WILLNEED)
+
+            step_size = min(left, chunksize)
+            # Read in advance to hopefully cache the contents in memory
+            # QUESTION: Would sendfile raise?
+            os.sendfile(null_fd, dst.fd, offset, step_size)
+            os.sendfile(null_fd, src.fd, offset, step_size)
+
+            try:
+                helper.src_offset = helper.dst_offset = offset
+                helper.length = step_size
+                step_deduped = helper.dedupe()
+            except DedupeError as ex:
+                if ex.status != FILE_DEDUPE_RANGE_DIFFERS:
+                    # Something else
+                    raise
+
+                if ex.bytes_deduped is None:
+                    step_deduped = chunksize_min  # minimum skip
+                else:
+                    # round up bytes_deduped to the least positive multiple of chunk_size_min
+                    step_deduped = max(chunksize_min, -(-ex.bytes_deduped // chunksize_min) * chunksize_min)
+
+                step_deduped = min(step_deduped, left)  # avoid left < 0 in future
+                chunksize = chunksize_min  # reduce chunksize
+
+                self.logger.warning(
+                    'task %d src %d dst %d are different at %d',
+                    task_id, src.path_index, dst.path_index, offset + (ex.bytes_deduped or 0),
+                )
+            else:
+                chunksize = min(chunksize * 2, chunksize_max)  # speed up if possible
+
+            # Discard what have passed from dst while keeping ones from src
+            os.posix_fadvise(dst.fd, offset, step_deduped, os.POSIX_FADV_DONTNEED)
+
+            offset += step_deduped
+            left -= step_deduped
+
+        return length - left
+
+    def _dedupe_group(self, task_id: int, event: threading.Event, paths: List[str]):
+        """
+        Given a list of paths, sort them using their extent distribution
+        Choose the good-looking one as the source file
+
+        :param task_id: for logging purpose
+        :param event: event is set if interrupted
+        :param paths: a list of file names to dedupe
+        """
+
+        start_time = time.monotonic()
+
+        deduped_bytes = 0
+        perf_timing = 0
+
+        with ExitStack() as exit_stack:
+            # store valid paths and their relatives in a list of quadruplets
+            dedupe_tuples = []
+            sizes = set()
+
+            for path_index, path in enumerate(paths):
+                if event.is_set():
+                    dedupe_tuples.clear()
+                    break
+
+                self.logger.debug('task %d path %d is %s', task_id, path_index, path)
+
+                try:
+                    dt = self._dedupe_open_file(task_id, path_index, path)
+                except (FileNotFoundError, PermissionError) as ex:
+                    self.logger.warning('task %d path %d is inaccessible: %s', task_id, path_index, repr(ex))
+                    continue
+
+                if dt is None:
+                    # Something wrong happened silently
+                    continue
+
+                exit_stack.callback(os.close, dt.fd)
+                dedupe_tuples.append(dt)
+                sizes.add(dt.size)
+
+            if len(sizes) >= 2:
+                # The files got modified somehow
+                self.logger.warning('task %d is skipped due to file changes, re-run is needed')
+                return
+
+            if len(dedupe_tuples) >= 2:
+                # FIXME: What if /dev/null missing?
+                null_fd = os.open('/dev/null', os.O_WRONLY | os.O_CLOEXEC)
+                exit_stack.callback(os.close, null_fd)
+
+                # Sort paths by extent distribution
+                dedupe_tuples.sort(key=lambda s: _extent_distribution_key(s.extents))
+                src = dedupe_tuples[0]
+
+                self.logger.debug('task %d choose path %d as src', task_id, src.path_index)
+
+                for extent in src.extents:
+                    if event.is_set():
+                        break
+
+                    for dst in dedupe_tuples[1:]:
+                        if event.is_set():
+                            break
+
+                        t0 = time.perf_counter()
+                        deduped_bytes += self._dedupe_extent(task_id, event, null_fd, extent, src, dst)
+                        perf_timing += time.perf_counter() - t0
+
+        deduped_mb = deduped_bytes / 1024 ** 2
+        used_time = time.monotonic() - start_time
+
+        if perf_timing > 0:
+            self.logger.debug(
+                'task %d deduped %.1fMB (%.2f MB/s) in %.2fs',
+                task_id, deduped_mb, deduped_mb / perf_timing, used_time,
+            )
+        else:
+            self.logger.debug('task %d done in %.2fs', task_id, used_time)
+
+        return deduped_bytes
 
     async def run(self):
-        if self.reset_done:
+        if self.reset_done or self.reset_hash:
             with self._scoped_session() as db:
-                db.query(File).update({
-                    File.done: False,
-                })
+                if self.reset_done:
+                    db.query(File).update({
+                        File.done: False,
+                    })
+
+                if self.reset_hash:
+                    db.query(File).update({
+                        File.hash1: None,
+                        File.hash2: None,
+                        File.hash3: None,
+                    })
+
                 db.commit()
 
         if not self.skip_scan:
-            await self._scan_files()
+            await self._do_scan()
 
         if not self.skip_hash:
-            await self._hash_files()
+            await self._do_hash()
 
-        await self._dedupe_files()
+        if not self.skip_dedupe:
+            await self._do_dedupe()
 
 
 def parser():
-    from argparse import ArgumentParser
     p = ArgumentParser()
     p.add_argument('--verbose', '-v', action='count', default=0)
     p.add_argument(
@@ -551,9 +790,19 @@ def parser():
         help='Skip file hashing phase',
     )
     p.add_argument(
+        '--skip-dedupe',
+        action='store_true', default=False,
+        help='Skip dedupe phase',
+    )
+    p.add_argument(
         '--reset-done',
         action='store_true', default=False,
         help='Reset the done flag',
+    )
+    p.add_argument(
+        '--reset-hash',
+        action='store_true', default=False,
+        help='Reset the computed hash values',
     )
     p.add_argument(
         '--no-purge-missing',
@@ -589,8 +838,9 @@ def main():
         db_file=ns.db_file,
         skip_scan=ns.skip_scan,
         skip_hash=ns.skip_hash,
+        skip_dedupe=ns.skip_dedupe,
         reset_done=ns.reset_done,
-        purge_missing=ns.purge_missing,
+        reset_hash=ns.reset_hash,
     )
     asyncio.run(runner.run())
 
