@@ -21,5 +21,5 @@ if __name__ == '__main__':
             'tqdm ==4.50.2',
         ],
         setup_requires=['cffi~=1.14.3'],
-        cffi_modules=['btrfslime/_fs_build.py:ffibuilder'],
+        cffi_modules=['btrfslime_cffi/build_fs.py:ffibuilder'],
     )
