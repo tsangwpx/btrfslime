@@ -160,7 +160,7 @@ class ThreadedRunner(Runner):
             task_futures = collections.deque()
             it: Iterator[AnyStr] = map(operator.itemgetter(0), iterate_files(self.roots, executor=executor))
 
-            def queue_task(t: Task):
+            def task_enqueue(t: Task):
                 f = executor.submit(self._check_task, t)
                 task_futures.append((t, f))
 
@@ -170,7 +170,7 @@ class ThreadedRunner(Runner):
                     if path is None:
                         break
                     task = self._create_task(path)
-                    queue_task(task)
+                    task_enqueue(task)
 
                 if not task_futures:
                     break
@@ -183,7 +183,7 @@ class ThreadedRunner(Runner):
                 self._defrag_task(task)
 
                 if task.frequency < self._repetitions:
-                    queue_task(task)
+                    task_enqueue(task)
 
 
 def parser():
@@ -209,29 +209,36 @@ def parser():
         action='store_true', default=False,
     )
     p.add_argument(
-        '--extent-size',
+        '--target-size',
+        dest='extent_size',
         type=binary_type, default=1024 ** 2 * 128,
         help='Target extent size (default: 128MB)',
     )
     p.add_argument(
-        '--small-extent-size',
+        '--acceptable-size',
+        dest='small_extent_size',
         type=binary_type, default=1024 ** 2 * 32,
-        help='Minimum size of acceptable extents (default: 32MB)',
+        help='Acceptable extent size (default: 32MB)',
     )
     p.add_argument(
         '--large-extent-size',
-        type=binary_type, default=1024 ** 2 * 128,
-        help='extent smaller than this will be considered (default: 128MB)',
+        type=binary_type, default=1024 ** 2 * 96,
+        help='Ignorable extent size (default: 64MB)',
     )
     p.add_argument(
         '--shared-size',
         type=binary_type, default=1024 ** 2 * 1,
-        help='shared extent smaller than this will be considered (default: 1MB)',
+        help='Ignorable shared extent size (default: 1MB)',
     )
     p.add_argument(
         '--tolerance',
         type=tolerance_type, default=0.1,
-        help='tolerable fraction of fragmented size / extents (default: 0.1)',
+        help='tolerable fraction in both size and number of extents (default: 0.1)',
+    )
+    p.add_argument(
+        '--dedupe',
+        action='store_true', default=False,
+        help='use ioctl FIDEDUPERANGE to defrag hopefully',
     )
     p.add_argument(
         '--repetitions',
