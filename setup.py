@@ -16,13 +16,19 @@ if __name__ == '__main__':
             'Development Status :: 4 - Beta',
         ],
         install_requires=[
-            'cffi~=1.14.3',
-            'sqlalchemy~=1.3.20',
-            'tqdm ==4.50.2',
+            'cffi~=1.14.4',
+            'sqlalchemy~=1.3.22',
+            'tqdm~=4.56.0',
         ],
-        setup_requires=['cffi~=1.14.3'],
+        setup_requires=['cffi~=1.14.4'],
         cffi_modules=[
             'btrfslime_cffi/build_fs.py:ffibuilder',
             'btrfslime_cffi/build_xxhash.py:ffibuilder',
         ],
+        entry_points={
+            'console_scripts': [
+                'btrfslime.defrag = btrfslime.defrag.__main__:main',
+                'btrfslime.dedupe = btrfslime.dedupe.__main__:main',
+            ],
+        },
     )
